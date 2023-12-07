@@ -1,93 +1,141 @@
-// Define the Region of Interest (ROI)
 var roi = ee.FeatureCollection("projects/ee-thiruvenkatesh4/assets/LULC_boundary");
-
-// 1. Import the Landsat 8 image
-var l8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA');
-
-// 2. NDVI Analysis for April 2013
-
-// Get the least cloudy image in April 2013.
-var imageApril2013 = ee.Image(
-  l8.filterBounds(roi)
-    .filterDate('2013-04-01', '2013-04-30')
-    .sort('CLOUD_COVER')
-    .first()
-);
-
-// Compute the Normalized Difference Vegetation Index (NDVI).
-var nirApril2013 = imageApril2013.select('B5');
-var redApril2013 = imageApril2013.select('B4');
-var ndviApril2013 = nirApril2013.subtract(redApril2013).divide(nirApril2013.add(redApril2013)).rename('NDVI');
-
-// Display NDVI April 2013 result.
-Map.centerObject(imageApril2013, 9);
-var ndviParams = {min: -1, max: 1, palette:['red', 'yellow', 'green']};
-Map.addLayer(ndviApril2013, ndviParams, 'NDVI image April 2013');
-
-
-// 3. NDVI Analysis for September 2023
-
-// Get the least cloudy image in September 2023.
-var imageSept2023 = ee.Image(
-  l8.filterBounds(roi)
-    .filterDate('2023-09-01', '2023-09-30')
-    .sort('CLOUD_COVER')
-    .first()
-);
-
-// Compute the Normalized Difference Vegetation Index (NDVI).
-var nirSept2023 = imageSept2023.select('B5');
-var redSept2023 = imageSept2023.select('B4');
-var ndviSept2023 = nirSept2023.subtract(redSept2023).divide(nirSept2023.add(redSept2023)).rename('NDVI');
-
-// Display NDVI September 2023 result.
-Map.centerObject(imageSept2023, 9);
-Map.addLayer(ndviSept2023, ndviParams, 'NDVI image September 2023');
-
-
-// 4. Change Detection Analysis
-var ndviChange = ndviApril2013.subtract(ndviSept2023);
-Map.addLayer(ndviChange, ndviParams, 'NDVI Change Detection Analysis');
-
-// 5. Calculate Total area of NDVI change between April 2013 and September 2023
-var threshold = 0.1;
-
-var changes = ndviChange.lte(threshold).or(ndviChange.gte(threshold)).selfMask();
-
-var pixelArea = changes.multiply(ee.Image.pixelArea());
-
-var area = pixelArea.reduceRegion({
-  reducer: ee.Reducer.sum(),
-  geometry: roi.geometry(), // Fix: Access geometry of the FeatureCollection
-  scale: 30,
-  maxPixels: 1e10
-});
-print('Total NDVI Change Area:', area);
-
-var areaKilometer = ee.Number(area.get('NDVI')).divide(1e6); // Convert to square kilometers
-print('Total NDVI Change Area (in square kilometers):', areaKilometer);
-
-// Export images to Google Drive
-Export.image.toDrive({
-  image: ndviChange,
-  description: 'NDVI_Change',
-  scale: 30,
-  region: roi.geometry(),
-  folder: 'Your_Folder_Name', // Replace with your folder name
+var study_area = roi.geometry();
+var date_start = ee.Date('2022-01-01');
+var date_end = ee.Date('2022-12-31');
+var long = ee.Number(study_area.centroid().coordinates().get(0)).getInfo();
+var lat = ee.Number(study_area.centroid().coordinates().get(1)).getInfo();
+Map.setCenter(long, lat, 12);
+var S2 = ee.ImageCollection("COPERNICUS/S2_SR")
+    .filterBounds(study_area)
+    .filterDate(date_start.advance(-1, 'year'), date_end);
+function filterS2_level2A(image) {
+    var SCL = image.select('SCL');
+    var mask01 = ee.Image(0).where(
+        SCL.lt(8).and(SCL.gt(3)), 1); //Put a 1 on good pixels
+    return image.updateMask(mask01);
+}
+var S2filtered = S2.map(filterS2_level2A);
+function addNDVI(image) {
+    var ndvi = image.normalizedDifference(['B8', 'B4'])
+        .multiply(10000).int16();
+    return image.addBands(ndvi.rename('ndvi'));
+}
+var S2filtered = S2filtered.map(addNDVI);
+var S2filtered = S2filtered.select('ndvi');
+var S2_clipped = S2filtered.map(function (img) {
+    return img.clip(study_area)
 });
 
-Export.image.toDrive({
-  image: ndviApril2013,
-  description: 'NDVI_April_2013',
-  scale: 30,
-  region: roi.geometry(),
-  folder: 'Your_Folder_Name', // Replace with your folder name
+var months = ee.List.sequence(1, 12);
+var years = ee.List.sequence(date_start.advance(-1, "year")
+    .get("year"),
+    date_end.get("year"));
+var composite = years.map(function (y) {
+    return ee.ImageCollection.fromImages(months.map(function (m) {
+        return S2_clipped.filter(ee.Filter.calendarRange(y, y, 'year'))
+            .filter(ee.Filter.calendarRange(m, m, 'month'))
+            .median()
+            .set('month', m, 'year', y);
+    }))
+});
+function decomposeList(l) {
+    return ee.ImageCollection(l).toList(12)
+}
+var list_imgs = composite.map(decomposeList).flatten();
+//set system id and system index according to year and month
+function renameImages(img1) {
+    var img = ee.Image(img1);
+    var value = ee.Number(img.get('year')).format('%04d')
+        .cat('_').cat(ee.Number(img.get('month')).format('%02d'));
+    return ee.Image(img.set('system:index', value, 'system:id', value))
+}
+var list_imgs_renamed = list_imgs.map(renameImages);
+var decomposed_collection = ee.ImageCollection(list_imgs_renamed);
+
+function setTime(img) {
+    return img.set('system:time_start', ee.Date.fromYMD(
+        img.get('year'), img.get('month'), 01).millis())
+}
+function addNumBands(img) {
+    return img.set('num_bands', img.bandNames().length())
+}
+function addTime(img) {
+    var time = ee.Image(img.date().millis()).rename('t').float();
+    return img.addBands(time)
+}
+function addConstant(img) {
+    return img.addBands(ee.Image.constant(1))
+}
+var decomposed_collection = decomposed_collection.map(addNumBands);
+var decomposed_collection = decomposed_collection
+    .filter('num_bands > 0');
+var decomposed_collection = decomposed_collection.map(setTime)
+var decomposed_collection = decomposed_collection.map(addConstant)
+var decomposed_collection = decomposed_collection.map(addTime)
+var dependent = 'ndvi';
+var harmonics = 3;
+var harmonicFrequencies = ee.List.sequence(1, harmonics);
+var getNames = function (base, list) {
+    return ee.List(list).map(function (i) {
+        return ee.String(base).cat(ee.Number(i).int());
+    });
+};
+var cosNames = getNames('cos_', harmonicFrequencies);
+var sinNames = getNames('sin_', harmonicFrequencies);
+var independents = ee.List(['constant', 't'])
+    .cat(cosNames).cat(sinNames);
+var addHarmonics = function (freqs) {
+    return function (image) {
+        // make an image of frequencies
+        var frequencies = ee.Image.constant(freqs);
+        // this band should represent time in radians.
+        var PI2 = 2.0 * Math.PI
+        var time = ee.Image(image).select('t').multiply(PI2 / (1000 * 60 * 60 * 24 * 365.25));
+        // get the cosine terms.
+        var cosines = time.multiply(frequencies).cos().rename(cosNames);
+        // get the sin terms.
+        var sines = time.multiply(frequencies).sin().rename(sinNames);
+        return image.addBands(cosines).addBands(sines);
+    };
+};
+// Add variables.
+var harmonicSentinel = decomposed_collection.map(
+    addHarmonics(harmonicFrequencies));
+var harmonicTrend = harmonicSentinel
+    .select(independents.add(dependent))
+    .reduce(ee.Reducer.linearRegression({
+        numX: independents.length(),
+        numY: 1
+    }));
+var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+    .arrayProject([0])
+    .arrayFlatten([independents]);
+var fittedHarmonic = harmonicSentinel.map(function (image) {
+    return image.addBands(image.select(independents)
+        .multiply(harmonicTrendCoefficients)
+        .reduce('sum')
+        .rename('fitted'));
 });
 
+var original_ndvi = decomposed_collection.select('ndvi');
+var fitted_ndvi = fittedHarmonic.select('fitted');
+var combined = original_ndvi.combine(fitted_ndvi);
+var gap_filled_composite = combined.map(function (img) {
+    return img.select('ndvi').unmask(img.select('fitted'))
+});
+var gap_filled_composite = gap_filled_composite
+    .filterDate(date_start, date_end);
+var singleBand = gap_filled_composite.toBands();
+Map.addLayer(singleBand, {
+    bands: '2022_08_ndvi',
+    min: 0,
+    max: 10000,
+    palette: ['white', 'green']
+}, 'ndvi august');
 Export.image.toDrive({
-  image: ndviSept2023,
-  description: 'NDVI_September_2023',
-  scale: 30,
-  region: roi.geometry(),
-  folder: 'Your_Folder_Name', // Replace with your folder name
+    image: singleBand,
+    description: 'NDVI_Composite_2022',
+    folder: 'GEE_exports',
+    scale: 10,
+    region: study_area
 });
