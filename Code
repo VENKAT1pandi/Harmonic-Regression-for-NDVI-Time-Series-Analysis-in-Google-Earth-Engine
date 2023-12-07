@@ -1,0 +1,93 @@
+// Define the Region of Interest (ROI)
+var roi = ee.FeatureCollection("projects/ee-thiruvenkatesh4/assets/LULC_boundary");
+
+// 1. Import the Landsat 8 image
+var l8 = ee.ImageCollection('LANDSAT/LC08/C01/T1_TOA');
+
+// 2. NDVI Analysis for April 2013
+
+// Get the least cloudy image in April 2013.
+var imageApril2013 = ee.Image(
+  l8.filterBounds(roi)
+    .filterDate('2013-04-01', '2013-04-30')
+    .sort('CLOUD_COVER')
+    .first()
+);
+
+// Compute the Normalized Difference Vegetation Index (NDVI).
+var nirApril2013 = imageApril2013.select('B5');
+var redApril2013 = imageApril2013.select('B4');
+var ndviApril2013 = nirApril2013.subtract(redApril2013).divide(nirApril2013.add(redApril2013)).rename('NDVI');
+
+// Display NDVI April 2013 result.
+Map.centerObject(imageApril2013, 9);
+var ndviParams = {min: -1, max: 1, palette:['red', 'yellow', 'green']};
+Map.addLayer(ndviApril2013, ndviParams, 'NDVI image April 2013');
+
+
+// 3. NDVI Analysis for September 2023
+
+// Get the least cloudy image in September 2023.
+var imageSept2023 = ee.Image(
+  l8.filterBounds(roi)
+    .filterDate('2023-09-01', '2023-09-30')
+    .sort('CLOUD_COVER')
+    .first()
+);
+
+// Compute the Normalized Difference Vegetation Index (NDVI).
+var nirSept2023 = imageSept2023.select('B5');
+var redSept2023 = imageSept2023.select('B4');
+var ndviSept2023 = nirSept2023.subtract(redSept2023).divide(nirSept2023.add(redSept2023)).rename('NDVI');
+
+// Display NDVI September 2023 result.
+Map.centerObject(imageSept2023, 9);
+Map.addLayer(ndviSept2023, ndviParams, 'NDVI image September 2023');
+
+
+// 4. Change Detection Analysis
+var ndviChange = ndviApril2013.subtract(ndviSept2023);
+Map.addLayer(ndviChange, ndviParams, 'NDVI Change Detection Analysis');
+
+// 5. Calculate Total area of NDVI change between April 2013 and September 2023
+var threshold = 0.1;
+
+var changes = ndviChange.lte(threshold).or(ndviChange.gte(threshold)).selfMask();
+
+var pixelArea = changes.multiply(ee.Image.pixelArea());
+
+var area = pixelArea.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: roi.geometry(), // Fix: Access geometry of the FeatureCollection
+  scale: 30,
+  maxPixels: 1e10
+});
+print('Total NDVI Change Area:', area);
+
+var areaKilometer = ee.Number(area.get('NDVI')).divide(1e6); // Convert to square kilometers
+print('Total NDVI Change Area (in square kilometers):', areaKilometer);
+
+// Export images to Google Drive
+Export.image.toDrive({
+  image: ndviChange,
+  description: 'NDVI_Change',
+  scale: 30,
+  region: roi.geometry(),
+  folder: 'Your_Folder_Name', // Replace with your folder name
+});
+
+Export.image.toDrive({
+  image: ndviApril2013,
+  description: 'NDVI_April_2013',
+  scale: 30,
+  region: roi.geometry(),
+  folder: 'Your_Folder_Name', // Replace with your folder name
+});
+
+Export.image.toDrive({
+  image: ndviSept2023,
+  description: 'NDVI_September_2023',
+  scale: 30,
+  region: roi.geometry(),
+  folder: 'Your_Folder_Name', // Replace with your folder name
+});
